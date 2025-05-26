@@ -6,113 +6,128 @@ const path = require('path');
 require('dotenv').config();
 
 const app = express();
-const port = 3000;
+const port = 3000; // Change to your desired port number
 
+// File paths in /tmp (writable in Render during runtime)
+const counterPath = '/tmp/alertIdCounter.json';
+const alertMappingPath = '/tmp/alertMapping.json';
+
+// Middleware to parse JSON bodies
 app.use(express.json());
 
-// File paths for counters and mappings
-const counterPath = path.join(__dirname, 'alertIdCounter.json');
-const alertMappingPath = path.join(__dirname, 'alertMapping.json');
+// In-memory variables for counter and mapping
+let alertIdCounter = 100; // Start from 100 or any number you want
+let alertMapping = {};
+
+// Load alertIdCounter and alertMapping from files on startup if they exist
+try {
+  const counterData = fs.readFileSync(counterPath, 'utf-8');
+  alertIdCounter = JSON.parse(counterData).counter || 100;
+  console.log(`Loaded alertIdCounter: ${alertIdCounter}`);
+} catch (err) {
+  console.log('Counter file not found, starting alertIdCounter at 100');
+}
+
+try {
+  const mappingData = fs.readFileSync(alertMappingPath, 'utf-8');
+  alertMapping = JSON.parse(mappingData);
+  console.log(`Loaded alertMapping with ${Object.keys(alertMapping).length} entries`);
+} catch (err) {
+  console.log('Alert mapping file not found, starting with empty mapping');
+}
+
+// Save functions to persist data back to /tmp files
+function saveCounter() {
+  fs.writeFileSync(counterPath, JSON.stringify({ counter: alertIdCounter }));
+}
+
+function saveMapping() {
+  fs.writeFileSync(alertMappingPath, JSON.stringify(alertMapping));
+}
 
 // GET endpoint for testing
-app.get('/webhook', (req, res) => {
+app.get('/webhook', async (req, res) => {
   console.log('GET request received');
   res.status(200).send("GET Reached");
 });
 
-// POST endpoint to handle webhook
+// POST endpoint to handle webhook, send email, and create a work item
 app.post('/webhook', async (req, res) => {
   console.log('POST request received');
   try {
     const payload = req.body;
     console.log('Request Payload:', payload);
 
-    const status = payload.status;
-    let alertId = payload.alertId;
-
-    if (status === 'resolved') {
-      // On resolve, find the existing work item and close it
-      if (!alertId) return res.status(400).send('Missing alertId for resolved alert');
-
-      const workItemId = getWorkItemIdForAlertId(alertId);
-      if (!workItemId) {
-        console.log(`No matching ADO work item found for alertId: ${alertId}`);
-        return res.status(404).send('No work item found for this resolved alert');
-      }
-
-      await closeWorkItemInAdo(workItemId);
-      return res.status(200).send(`Resolved alert processed. ADO ticket ${workItemId} closed.`);
-    }
-
-    // Validate payload
     if (!payload.title || !payload.message) {
+      console.log('Invalid payload:', payload);
       return res.status(400).send('Invalid payload');
     }
 
-    // Clean title and message
+    // The unique key we'll use to identify alerts - use fingerprint or groupKey or any unique field
+    const alertKey = payload.groupKey || (payload.alerts && payload.alerts[0] && payload.alerts[0].fingerprint);
+    if (!alertKey) {
+      return res.status(400).send('No unique alert key found in payload');
+    }
+
+    // Generate or get alertId from mapping
+    let alertId;
+    if (alertMapping[alertKey]) {
+      alertId = alertMapping[alertKey];
+      console.log(`Found existing alertId for alertKey: ${alertKey} => ${alertId}`);
+    } else {
+      alertIdCounter++;
+      const idNumber = alertIdCounter.toString().padStart(3, '0');
+      alertId = `ALR-SWF-${idNumber}`;
+      alertMapping[alertKey] = alertId;
+      saveCounter();
+      saveMapping();
+      console.log(`Generated new alertId: ${alertId} for alertKey: ${alertKey}`);
+    }
+
+    // Modify the title by removing content inside parentheses
     let title = payload.title.replace(/\(.*\)/, '').trim();
+
+    // Extract and filter the message part from the payload
     let message = payload.message.split('Annotations:')[0];
     message = message.replace(/Value: .*?(Messages_behind=\d+)/, 'Value: $1')
                      .replace(/(Messages_behind=\d+)/g, '<strong>$1</strong>');
 
+    // Extract the 'summary' field from 'commonAnnotations'
     let summary = '';
-    if (payload.commonAnnotations?.summary) {
+    if (payload.commonAnnotations && payload.commonAnnotations.summary) {
       summary = payload.commonAnnotations.summary.trim();
+      console.log('Extracted Summary:', summary);
     }
+
+    // Get the status of the alert
+    const status = payload.status || (payload.alerts && payload.alerts[0] && payload.alerts[0].status);
 
     if (status === 'firing' && summary) {
       message += `<br><strong>Summary:</strong> <span style="color: red;">${summary}</span>`;
     }
 
-    // Generate alertId if not provided
-    if (!alertId) {
-      alertId = generateSequentialAlertId();
+    // If alert is resolved, close the ADO ticket
+    if (status === 'resolved') {
+      await closeWorkItem(alertId);
+      res.status(200).send(`Alert resolved. Work item closed for Alert ID: ${alertId}`);
+      return;
     }
-
-    console.log('Generated or Received Alert ID:', alertId);
 
     // Send email
     await sendEmail(alertId, title, message);
 
-    // Create ADO work item
-    const workItemData = { title, description: message };
-    const response = await createWorkItem(workItemData);
-    const workItemId = response.data.id;
-    console.log('Work item created:', workItemId);
+    // Create or update ADO work item
+    const workItemData = { title: `${alertId} - ${title}`, description: message };
+    const response = await createOrUpdateWorkItem(alertId, workItemData);
 
-    // Store mapping
-    storeAlertWorkItemMapping(alertId, workItemId);
-
-    res.status(200).send(`Alert email sent and work item created. Alert ID: ${alertId}`);
+    res.status(200).send(`Alert email sent and work item processed successfully. Alert ID: ${alertId}`);
   } catch (error) {
     console.error('Error:', error.response ? error.response.data : error.message);
     res.status(500).send('Error processing webhook');
   }
 });
 
-// Generate sequential alert ID like ALR-SWF-001
-function generateSequentialAlertId() {
-  const counterData = JSON.parse(fs.readFileSync(counterPath, 'utf8'));
-  let lastId = counterData.lastId || 0;
-  lastId += 1;
-  fs.writeFileSync(counterPath, JSON.stringify({ lastId }));
-  return `ALR-SWF-${String(lastId).padStart(3, '0')}`;
-}
-
-// Store alertId → workItemId
-function storeAlertWorkItemMapping(alertId, workItemId) {
-  const mappings = JSON.parse(fs.readFileSync(alertMappingPath, 'utf8'));
-  mappings[alertId] = workItemId;
-  fs.writeFileSync(alertMappingPath, JSON.stringify(mappings));
-}
-
-// Retrieve workItemId by alertId
-function getWorkItemIdForAlertId(alertId) {
-  const mappings = JSON.parse(fs.readFileSync(alertMappingPath, 'utf8'));
-  return mappings[alertId];
-}
-
-// Send email
+// Function to send email
 async function sendEmail(alertId, title, message) {
   const transporter = nodemailer.createTransport({
     service: 'Outlook',
@@ -133,7 +148,7 @@ async function sendEmail(alertId, title, message) {
   const recipients = [
     process.env.EMAIL_TO,
     process.env.EMAIL_TO_1,
-    process.env.EMAIL_TO_2
+    process.env.EMAIL_TO_2,
   ].filter(Boolean).join(', ');
 
   const mailOptions = {
@@ -147,15 +162,18 @@ async function sendEmail(alertId, title, message) {
   };
 
   await transporter.sendMail(mailOptions);
-  console.log(`Email sent successfully. Message ID: ${alertId}`);
+  console.log(`Email sent successfully to all recipients. Message ID: ${alertId}`);
 }
 
-// Create ADO work item
-async function createWorkItem(workItemData) {
+// Function to create or update Azure DevOps work item
+async function createOrUpdateWorkItem(alertId, workItemData) {
   const organization = 'TICMPL';
   const project = 'Training';
-  const pat = process.env.PAT;
+  const personalAccessToken = process.env.PAT;
   const type = 'Bug';
+
+  // Here you can implement logic to search for an existing work item by alertId in title or custom field
+  // For now, let's always create a new work item for firing alerts
 
   const url = `https://dev.azure.com/${organization}/${project}/_apis/wit/workitems/$${type}?api-version=6.0`;
 
@@ -167,40 +185,55 @@ async function createWorkItem(workItemData) {
   const config = {
     headers: {
       'Content-Type': 'application/json-patch+json',
-      Authorization: `Basic ${Buffer.from(`:${pat}`).toString('base64')}`,
+      Authorization: `Basic ${Buffer.from(`:${personalAccessToken}`).toString('base64')}`,
     },
   };
 
-  return axios.post(url, workItemFields, config);
+  const response = await axios.post(url, workItemFields, config);
+  console.log('Work item created:', response.data);
+  return response;
 }
 
-// Close ADO work item
-async function closeWorkItemInAdo(workItemId) {
+// Function to close Azure DevOps work item by searching with alertId in title
+async function closeWorkItem(alertId) {
   const organization = 'TICMPL';
   const project = 'Training';
-  const pat = process.env.PAT;
+  const personalAccessToken = process.env.PAT;
 
-  const url = `https://dev.azure.com/${organization}/${project}/_apis/wit/workitems/${workItemId}?api-version=6.0`;
-
-  const updatePayload = [
-    {
-      op: 'add',
-      path: '/fields/System.State',
-      value: 'Closed', // Change as per your ADO workflow
-    }
-  ];
-
+  // Search for work item by alertId in title (simple WIQL query)
+  const wiqlUrl = `https://dev.azure.com/${organization}/${project}/_apis/wit/wiql?api-version=6.0`;
+  const wiqlQuery = {
+    query: `Select [System.Id] From WorkItems Where [System.Title] Contains '${alertId}' And [System.State] <> 'Closed'`
+  };
   const config = {
     headers: {
-      'Content-Type': 'application/json-patch+json',
-      Authorization: `Basic ${Buffer.from(`:${pat}`).toString('base64')}`,
+      'Content-Type': 'application/json',
+      Authorization: `Basic ${Buffer.from(`:${personalAccessToken}`).toString('base64')}`,
     },
   };
 
-  return axios.patch(url, updatePayload, config);
+  const wiqlResponse = await axios.post(wiqlUrl, wiqlQuery, config);
+  const workItems = wiqlResponse.data.workItems;
+  if (!workItems || workItems.length === 0) {
+    console.log(`No open work items found for alert ID ${alertId}`);
+    return;
+  }
+
+  // Close all found work items
+  for (const item of workItems) {
+    const workItemId = item.id;
+    const updateUrl = `https://dev.azure.com/${organization}/${project}/_apis/wit/workitems/${workItemId}?api-version=6.0`;
+    const closePayload = [
+      { op: 'add', path: '/fields/System.State', value: 'Closed' },
+      { op: 'add', path: '/fields/System.Reason', value: 'Resolved' }
+    ];
+
+    await axios.patch(updateUrl, closePayload, config);
+    console.log(`Closed work item ID: ${workItemId} for alert ID: ${alertId}`);
+  }
 }
 
-// Start server
+// Start the server
 app.listen(port, () => {
-  console.log(`Server running on port ${port}`);
+  console.log(`Server is running on port ${port}`);
 });
